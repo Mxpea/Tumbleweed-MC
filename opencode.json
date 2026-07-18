@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": {
+    "paths": [
+      "~/.opencode/matt-pocock-skills/skills/engineering",
+      "~/.opencode/matt-pocock-skills/skills/productivity",
+      "~/.opencode/matt-pocock-skills/skills/misc"
+    ]
+  }
+}
