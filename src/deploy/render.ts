@@ -160,18 +160,31 @@ case "$CORE_MODE" in
     if [ "$CORE_TYPE" = "fabric" ]; then
       MC=$(jq_iter '.server.core.mcVersion')
       LD=$(jq_iter '.server.core.loaderVersion')
+      INSTALL_CMD="java -jar \"$CORE_FILE\" server -mcversion \"$MC\" -loader \"$LD\" -downloadMinecraft"
       if [ -n "\${JAVA_HOME:-}" ]; then
-        "\${JAVA_HOME}/bin/java" -jar "$CORE_FILE" server -mcversion "\$MC" -loader "\$LD" -downloadMinecraft
-      else
-        java -jar "$CORE_FILE" server -mcversion "\$MC" -loader "\$LD" -downloadMinecraft
+        INSTALL_CMD="\${JAVA_HOME}/bin/java -jar \"$CORE_FILE\" server -mcversion \"$MC\" -loader \"$LD\" -downloadMinecraft"
       fi
     else
       if [ -n "\${JAVA_HOME:-}" ]; then
-        "\${JAVA_HOME}/bin/java" -jar "$CORE_FILE" --installServer
+        INSTALL_CMD="\${JAVA_HOME}/bin/java -jar \"$CORE_FILE\" --installServer"
       else
-        java -jar "$CORE_FILE" --installServer
+        INSTALL_CMD="java -jar \"$CORE_FILE\" --installServer"
       fi
     fi
+    # 最多重试 5 次：已下载的 libraries 会被跳过，只重试失败的
+    for ATTEMPT in 1 2 3 4 5; do
+      echo "  installer 第 $ATTEMPT/5 次尝试……"
+      if eval "$INSTALL_CMD"; then
+        echo "  installer 成功"
+        break
+      fi
+      if [ "$ATTEMPT" -eq 5 ]; then
+        echo "  installer 5 次均失败，请检查网络（maven.neoforged.net 可能被墙）" >&2
+        exit 1
+      fi
+      echo "  installer 失败，等待 3 秒后重试……" >&2
+      sleep 3
+    done
     rm -f "$CORE_FILE"
     ;;
   paperclip|vanilla|launch-jar)
@@ -387,10 +400,29 @@ Write-Host "[4/6] 安装 loader……"
 switch ($core.launchMode) {
   'installer' {
     $java = if ($env:JAVA_HOME) { "$env:JAVA_HOME/bin/java.exe" } else { 'java' }
-    if ($core.type -eq 'fabric') {
-      & $java -jar $coreFile server -mcversion $core.mcVersion -loader $core.loaderVersion -downloadMinecraft
-    } else {
-      & $java -jar $coreFile --installServer
+    # 最多重试 5 次：已下载的 libraries 会被跳过，只重试失败的
+    $installOk = $false
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+      Write-Host "  installer 第 $attempt/5 次尝试……"
+      try {
+        if ($core.type -eq 'fabric') {
+          & $java -jar $coreFile server -mcversion $core.mcVersion -loader $core.loaderVersion -downloadMinecraft
+        } else {
+          & $java -jar $coreFile --installServer
+        }
+        if ($LASTEXITCODE -eq 0 -or $null -eq $LASTEXITCODE) {
+          Write-Host "  installer 成功"
+          $installOk = $true
+          break
+        }
+      } catch { }
+      if ($attempt -lt 5) {
+        Write-Host "  installer 失败，等待 3 秒后重试……" -ForegroundColor Yellow
+        Start-Sleep -Seconds 3
+      } else {
+        Write-Host "  installer 5 次均失败，请检查网络（maven.neoforged.net 可能被墙）" -ForegroundColor Red
+        throw "installer 安装失败"
+      }
     }
     Remove-Item -Force $coreFile
   }
