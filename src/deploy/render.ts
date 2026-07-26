@@ -80,8 +80,10 @@ done
 
 python3 - <<'PYEOF' 2>&1 || true
 import json, os, sys, hashlib, urllib.request
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-json_text = open('/dev/stdin').read() if False else """${jsonText}"""
+json_text = """${jsonText}"""
 d = json.loads(json_text)
 
 def sha512(p):
@@ -93,39 +95,52 @@ def sha512(p):
             h.update(b)
     return h.hexdigest()
 
-ok = True
-for f in d.get('files', []):
+TOTAL = len(d.get('files', []))
+done = [0]
+max_workers = max(4, min(16, (TOTAL or 1)))
+print(f"  共 {TOTAL} 个文件，并发 {max_workers} 下载")
+
+def handle(f):
     path = f['path']
     dl = f.get('downloads', [])
     expected = f['hashes']['sha512']
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     if dl:
         url = dl[0]
-        print(f"  下载 {path} <- {url}")
         try:
             req = urllib.request.Request(url, headers={'User-Agent':'tumbleweed-deploy/0.1'})
-            with urllib.request.urlopen(req, timeout=120) as r, open(path, 'wb') as out:
+            with urllib.request.urlopen(req, timeout=180) as r, open(path, 'wb') as out:
                 while True:
                     b = r.read(1<<20)
                     if not b: break
                     out.write(b)
         except Exception as e:
-            print(f"  ERROR 下载失败 {path}: {e}", file=sys.stderr)
-            ok = False
-            continue
+            return (path, f"下载失败: {e}")
         if expected and sha512(path).lower() != expected.lower():
-            print(f"  ERROR sha512 校验失败: {path}", file=sys.stderr)
-            ok = False
+            return (path, "sha512 校验失败")
     else:
         embed = f.get('embedPath') or ('overrides/' + path)
-        print(f"  从 {embed} 复制 -> {path}")
-        import shutil
-        shutil.copyfile(embed, path)
+        try:
+            shutil.copyfile(embed, path)
+        except Exception as e:
+            return (path, f"复制失败: {e}")
         if expected and sha512(path).lower() != expected.lower():
-            print(f"  ERROR sha512 校验失败: {path}", file=sys.stderr)
-            ok = False
+            return (path, "sha512 校验失败")
+    done[0] += 1
+    return (path, None)
 
-sys.exit(0 if ok else 1)
+errors = []
+with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    futures = {pool.submit(handle, f): f for f in d.get('files', [])}
+    for fut in as_completed(futures):
+        path, err = fut.result()
+        if err:
+            print(f"  ERROR {path}: {err}", file=sys.stderr)
+            errors.append(path)
+        else:
+            print(f"  [{done[0]}/{TOTAL}] OK {path}")
+
+sys.exit(0 if not errors else 1)
 PYEOF
 
 # 3. 下载 loader / server core
@@ -142,10 +157,20 @@ fi
 case "$CORE_MODE" in
   installer)
     echo "[4/6] 运行 installer 安装 libraries……"
-    if [ -n "\${JAVA_HOME:-}" ]; then
-      "\${JAVA_HOME}/bin/java" -jar "$CORE_FILE" --installServer
+    if [ "$CORE_TYPE" = "fabric" ]; then
+      MC=$(jq_iter '.server.core.mcVersion')
+      LD=$(jq_iter '.server.core.loaderVersion')
+      if [ -n "\${JAVA_HOME:-}" ]; then
+        "\${JAVA_HOME}/bin/java" -jar "$CORE_FILE" server -mcversion "\$MC" -loader "\$LD" -downloadMinecraft
+      else
+        java -jar "$CORE_FILE" server -mcversion "\$MC" -loader "\$LD" -downloadMinecraft
+      fi
     else
-      java -jar "$CORE_FILE" --installServer
+      if [ -n "\${JAVA_HOME:-}" ]; then
+        "\${JAVA_HOME}/bin/java" -jar "$CORE_FILE" --installServer
+      else
+        java -jar "$CORE_FILE" --installServer
+      fi
     fi
     rm -f "$CORE_FILE"
     ;;
@@ -163,6 +188,7 @@ echo "[5/6] 已写入 eula.txt"
 echo "[6/6] 最终校验……"
 python3 - <<'PYEOF'
 import json, os, sys, hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 d = json.loads("""${jsonText}""")
 
@@ -175,27 +201,41 @@ def sha512(p):
             h.update(b)
     return h.hexdigest()
 
-bad = 0
-for f in d.get('files', []):
+def check_one(f):
     p = f['path']
     if not os.path.exists(p):
-        print(f"  MISSING: {p}", file=sys.stderr)
-        bad += 1
-        continue
+        return (p, "MISSING")
     if f['hashes'].get('sha512') and sha512(p).lower() != f['hashes']['sha512'].lower():
-        print(f"  HASH MISMATCH: {p}", file=sys.stderr)
-        bad += 1
+        return (p, "HASH MISMATCH")
+    return (p, None)
+
+bad = []
+files = d.get('files', [])
+max_workers = max(4, min(16, (len(files) or 1)))
+with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    for fut in as_completed([pool.submit(check_one, f) for f in files]):
+        p, err = fut.result()
+        if err:
+            print(f"  {err}: {p}", file=sys.stderr)
+            bad.append(p)
+
 for ef in d.get('server', {}).get('extraFiles', []):
     p = ef['path']
     if ef.get('packed') and not os.path.exists(p):
         print(f"  EXTRA MISSING: {p}", file=sys.stderr)
-        bad += 1
+        bad.append(p)
 
-sys.exit(0 if bad == 0 else 1)
+sys.exit(0 if not bad else 1)
 PYEOF
 
 if [ $? -eq 0 ]; then
-  echo "✓ Tumbleweed 部署完成。运行：java -jar server.jar nogui"
+  if [ -f run.sh ]; then
+    echo "✓ Tumbleweed 部署完成。NeoForge 21+ 请运行：bash run.sh"
+  elif [ -f fabric-server-launch.jar ]; then
+    echo "✓ Tumbleweed 部署完成。运行：java -jar fabric-server-launch.jar nogui"
+  elif [ -f server.jar ]; then
+    echo "✓ Tumbleweed 部署完成。运行：java -jar server.jar nogui"
+  fi
 else
   echo "✗ 校验失败，请排查上方错误"
   exit 1
@@ -226,20 +266,6 @@ ${jsonText}
 
 $Config = $JsonText | ConvertFrom-Json
 
-function Get-FileSha512 {
-  param([string]$Path)
-  $s = $null
-  $sha = $null
-  try {
-    $s = [System.IO.File]::OpenRead($Path)
-    $sha = [System.Security.Cryptography.SHA512]::Create()
-    return ([System.BitConverter]::ToString($sha.ComputeHash($s)) -replace '-', '').ToLower()
-  } finally {
-    if ($sha) { $sha.Dispose() }
-    if ($s) { $s.Dispose() }
-  }
-}
-
 function Download-With-Retry {
   param([string]$Url, [string]$OutPath, [int]$Retries = 3)
   for ($i = 1; $i -le $Retries; $i++) {
@@ -266,22 +292,87 @@ if (Test-Path overrides) {
   Copy-Item -Recurse -Force overrides/* . 2>$null
 }
 
-# 2. 下载 / 还原 files
+# 2. 下载 / 还原 files（用 curl.exe，原生支持 Unicode 路径）
 Write-Host "[2/6] 下载 mods / plugins……"
+$total = $Config.files.Count
+Write-Host "  共 $total 个文件"
+
+# 准备所有目录
+$dirsToCreate = $Config.files | ForEach-Object { Split-Path $_.path -Parent } | Where-Object { $_ } | Sort-Object -Unique
+foreach ($d in $dirsToCreate) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+
+function Get-FileSha512($p) {
+  $s = $null; $sha = $null
+  try {
+    $s = [System.IO.File]::OpenRead($p)
+    $sha = [System.Security.Cryptography.SHA512]::Create()
+    return ([System.BitConverter]::ToString($sha.ComputeHash($s)) -replace '-', '').ToLower()
+  } finally {
+    if ($sha) { $sha.Dispose() }
+    if ($s) { $s.Dispose() }
+  }
+}
+
+$downloadErrors = [System.Collections.Generic.List[string]]::new()
+$done = 0
+
 foreach ($f in $Config.files) {
+  $done++
   $path = $f.path
   $dir = Split-Path $path -Parent
   if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+
   if ($f.downloads -and $f.downloads.Count -gt 0) {
-    Download-With-Retry -Url $f.downloads[0] -OutPath $path
+    $url = $f.downloads[0]
+    $tmp = "$path.part"
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    # curl.exe -o 路径走字面量，[-] 不会被当通配符
+    $curlOk = $false
+    for ($i = 1; $i -le 3; $i++) {
+      & curl.exe -fsSL --retry 3 --retry-delay 2 --connect-timeout 30 -o $tmp -H "User-Agent: tumbleweed-deploy/0.1" $url 2>$null
+      if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $tmp)) {
+        $curlOk = $true
+        break
+      }
+      if ($i -lt 3) { Start-Sleep -Seconds (2 * $i) }
+    }
+    if (-not $curlOk) {
+      $downloadErrors.Add($path) | Out-Null
+      Write-Host ("  [{0}/{1}] FAIL {2}: curl 下载失败" -f $done, $total, $path)
+      continue
+    }
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    Rename-Item -LiteralPath $tmp -NewName (Split-Path $path -Leaf)
   } else {
     $embed = if ($f.embedPath) { $f.embedPath } else { "overrides/$path" }
-    Write-Host "  从 $embed 复制 -> $path"
-    Copy-Item -Force $embed $path
+    try {
+      Copy-Item -LiteralPath $embed -Destination $path -Force
+    } catch {
+      $downloadErrors.Add($path) | Out-Null
+      Write-Host ("  [{0}/{1}] FAIL {2}: 复制失败" -f $done, $total, $path)
+      continue
+    }
   }
-  if ($f.hashes.sha512 -and (Get-FileSha512 $path) -ne $f.hashes.sha512.ToLower()) {
-    throw "SHA512 校验失败: $path"
+
+  if (-not (Test-Path -LiteralPath $path)) {
+    $downloadErrors.Add($path) | Out-Null
+    Write-Host ("  [{0}/{1}] FAIL {2}: 文件不存在" -f $done, $total, $path)
+    continue
   }
+
+  if ($f.hashes.sha512) {
+    $actual = Get-FileSha512 $path
+    if ($actual -ne $f.hashes.sha512.ToLower()) {
+      $downloadErrors.Add($path) | Out-Null
+      Write-Host ("  [{0}/{1}] FAIL {2}: sha512 不匹配" -f $done, $total, $path)
+      continue
+    }
+  }
+  Write-Host ("  [{0}/{1}] OK   {2}" -f $done, $total, $path)
+}
+
+if ($downloadErrors.Count -gt 0) {
+  throw "下载失败 $($downloadErrors.Count) 个：$($downloadErrors -join ', ')"
 }
 
 # 3. 下载 server core
@@ -296,7 +387,11 @@ Write-Host "[4/6] 安装 loader……"
 switch ($core.launchMode) {
   'installer' {
     $java = if ($env:JAVA_HOME) { "$env:JAVA_HOME/bin/java.exe" } else { 'java' }
-    & $java -jar $coreFile --installServer
+    if ($core.type -eq 'fabric') {
+      & $java -jar $coreFile server -mcversion $core.mcVersion -loader $core.loaderVersion -downloadMinecraft
+    } else {
+      & $java -jar $coreFile --installServer
+    }
     Remove-Item -Force $coreFile
   }
   'paperclip' { Move-Item -Force $coreFile server.jar }
@@ -308,29 +403,44 @@ switch ($core.launchMode) {
 Set-Content -Path eula.txt -Value "eula=true" -Encoding ascii
 Write-Host "[5/6] 已写入 eula.txt"
 
-# 6. 全量校验
+# 6. 全量校验（串行，用 LiteralPath 避免 [-] 通配符问题）
 Write-Host "[6/6] 最终校验……"
-$bad = 0
+$bad = [System.Collections.Generic.List[string]]::new()
+$total = $Config.files.Count
+$verifyDone = 0
 foreach ($f in $Config.files) {
-  if (-not (Test-Path $f.path)) {
+  $verifyDone++
+  if (-not (Test-Path -LiteralPath $f.path)) {
     Write-Error "MISSING: $($f.path)"
-    $bad++
-  } elseif ($f.hashes.sha512 -and (Get-FileSha512 $f.path) -ne $f.hashes.sha512.ToLower()) {
-    Write-Error "HASH MISMATCH: $($f.path)"
-    $bad++
+    $bad.Add($f.path) | Out-Null
+    continue
+  }
+  if ($f.hashes.sha512) {
+    $expected = $f.hashes.sha512.ToLower()
+    $actual = Get-FileSha512 $f.path
+    if ($actual -ne $expected) {
+      Write-Error "HASH MISMATCH: $($f.path)"
+      $bad.Add($f.path) | Out-Null
+    }
   }
 }
 foreach ($ef in $Config.server.extraFiles) {
-  if ($ef.packed -and -not (Test-Path $ef.path)) {
+  if ($ef.packed -and -not (Test-Path -LiteralPath $ef.path)) {
     Write-Error "EXTRA MISSING: $($ef.path)"
-    $bad++
+    $bad.Add($ef.path) | Out-Null
   }
 }
 
-if ($bad -eq 0) {
-  Write-Host "OK Tumbleweed 部署完成。运行：java -jar server.jar nogui"
+if ($bad.Count -eq 0) {
+  if (Test-Path run.bat) {
+    Write-Host "OK Tumbleweed 部署完成。NeoForge 21+ 请运行：.\run.bat"
+  } elseif (Test-Path fabric-server-launch.jar) {
+    Write-Host "OK Tumbleweed 部署完成。运行：java -jar fabric-server-launch.jar nogui"
+  } elseif (Test-Path server.jar) {
+    Write-Host "OK Tumbleweed 部署完成。运行：java -jar server.jar nogui"
+  }
 } else {
-  throw "校验失败：$bad 个文件缺失或哈希不匹配"
+  throw "校验失败：$($bad.Count) 个文件缺失或哈希不匹配：$($bad -join ', ')"
 }
 `;
 }
@@ -343,7 +453,6 @@ setlocal enableextensions
 
 echo Generated by Tumbleweed ${ver}
 
-REM "%~dp0." 去掉路径末尾反斜杠，避免 PowerShell 把 \" 当转义
 where pwsh >nul 2>nul
 if %errorlevel%==0 (
   pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy.ps1" -WorkDir "%~dp0." %*

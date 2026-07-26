@@ -22,13 +22,15 @@ export const DEFAULT_DIR_WHITELIST: readonly string[] = [
   'liberty',
 ];
 
-/** KubeJS 子目录白名单：仅这些子目录默认纳入，其他子目录（如 build/probe/cache）排除 */
-export const KUBEJS_SUBDIR_WHITELIST: readonly string[] = [
-  'client_scripts',
-  'server_scripts',
-  'startup_scripts',
-  'assets',
-  'data',
+/** KubeJS 子目录黑名单：这些子目录默认排除（如 build/probe/cache 是临时/缓存）
+ * 其余 kubejs 下所有文件与子目录默认纳入打包
+ */
+export const KUBEJS_SUBDIR_BLACKLIST: readonly string[] = [
+  'build',
+  'probe',
+  'cache',
+  '.cache',
+  'generated',
 ];
 
 /**
@@ -149,10 +151,11 @@ export function shouldPack(relPath: string, policy: FilterPolicy): boolean {
   }
   if (policy.includeFiles.includes(relPath)) return true;
 
-  // 2. KubeJS 子目录白名单过滤
+  // 2. KubeJS 子目录：黑名单排除，其余（含顶层文件、client_scripts/、assets/ 等）全部纳入
   if (top === 'kubejs') {
+    if (parts.length === 1) return true; // kubejs 目录本身
     const sub = parts[1] ?? '';
-    if (!KUBEJS_SUBDIR_WHITELIST.includes(sub)) return false;
+    if (KUBEJS_SUBDIR_BLACKLIST.includes(sub)) return false;
     return true;
   }
 
