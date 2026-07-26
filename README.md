@@ -8,7 +8,7 @@ Minecraft 服务端打包工具。把服务器目录里"重要文件"打包成�
 
 ### 1. 环境准备
 
-- Node.js ≥ 20（用 [nvs](https://github.com/jasonk/nvs) 管理：`nvs use latest`）
+- Node.js ≥ 20（用 [nvs](https://github.com/jasongin/nvs) 管理：`nvs use latest`）
 - Windows / Linux / macOS 均可
 
 ```powershell
